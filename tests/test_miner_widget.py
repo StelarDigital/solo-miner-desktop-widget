@@ -332,7 +332,89 @@ class AlertTests(unittest.TestCase):
         r = self.poll(temp=71)
         self.assertEqual(r["alerts"], [{"code": "HOT", "level": "red", "text": "HOT · 71 °C"}])
         self.assertEqual(self.poll(temp=70)["alerts"][0]["code"], "HOT")
+        self.assertEqual(self.codes(self.poll(temp=69.9)), ["HOT"])
+        self.assertEqual(self.poll(temp=67.9)["alerts"], [])
+
+    def test_hot_edge_does_not_flap(self):
+        self.poll()
+        for i in range(40):
+            r = self.poll(temp=70.1 if i % 2 else 69.9)
+        self.assertEqual(self.codes(r), ["HOT"])
+        self.assertEqual([l.split(" | ")[3] for l in self.lines()], ["raised"])
+        self.assertEqual(self.bodies(), ["Miner 1: running hot, 70 °C"])
+        self.assertEqual(self.poll(temp=68)["alerts"][0]["code"], "HOT")
+        self.assertEqual(self.poll(temp=67.9)["alerts"], [])
+        self.assertEqual([l.split(" | ")[3] for l in self.lines()], ["raised", "cleared"])
+        self.assertEqual(self.bodies()[1:], ["Miner 1: back to normal"])
         self.assertEqual(self.poll(temp=69.9)["alerts"], [])
+
+    def test_hot_clear_margin_is_configurable(self):
+        self.assertEqual(mws.DEFAULTS["hot_clear_margin_c"], 2)
+        self.setup_poller({"miners": [{"name": "Miner 1", "host": "x"}], "alerts": {"hot_clear_margin_c": 5}})
+        self.poll(temp=71); self.assertEqual(self.codes(self.poll(temp=65.5)), ["HOT"])
+        self.assertEqual(self.poll(temp=64.9)["alerts"], [])
+
+    def test_reboot_zero_hashrate_raises_nothing_for_two_minutes(self):
+        self.poll()
+        for up in range(5, 95, 15):
+            self.assertEqual(self.poll(hashRate=0, uptimeSeconds=up)["alerts"], [])
+        self.assertEqual(self.poll(hashRate=0, uptimeSeconds=119)["alerts"], [])
+        self.assertEqual(self.notes, [])
+        self.poll(hashRate=0, uptimeSeconds=130)
+        self.assertEqual(self.codes(self.poll(hashRate=0, uptimeSeconds=145)), ["NOT_MINING"])
+        self.assertEqual(self.bodies(), ["Miner 1: not mining, hashrate is zero"])
+
+    def test_zero_hashrate_with_long_uptime_raises_on_two_polls(self):
+        self.poll(uptimeSeconds=600)
+        self.assertEqual(self.poll(hashRate=0, uptimeSeconds=615)["alerts"], [])
+        self.assertEqual(self.codes(self.poll(hashRate=0, uptimeSeconds=630)), ["NOT_MINING"])
+
+    def test_missing_uptime_field_behaves_as_before(self):
+        self.cur.pop("uptimeSeconds")
+        self.poll(); self.poll(hashRate=0)
+        self.assertEqual(self.codes(self.poll(hashRate=0)), ["NOT_MINING"])
+
+    def test_offline_then_answering_with_a_problem_is_not_back_to_normal(self):
+        self.poll(hashRate=0, uptimeSeconds=600); self.poll(hashRate=0, uptimeSeconds=615)
+        self.assertEqual(self.bodies(), ["Miner 1: not mining, hashrate is zero"])
+        self.cur = None
+        self.span(180)
+        self.assertEqual(self.codes(self.poll()), ["OFFLINE"])
+        self.assertEqual(self.bodies()[-1], "Miner 1: not answering")
+        self.cur = dict(BASE, hashRate=0, uptimeSeconds=900)
+        self.assertEqual(self.poll()["alerts"], [])
+        self.assertNotIn("Miner 1: back to normal", self.bodies())
+        self.poll(hashRate=0, uptimeSeconds=915)
+        self.assertEqual(self.codes(self.poll(hashRate=0, uptimeSeconds=930)), ["NOT_MINING"])
+        self.assertNotIn("Miner 1: back to normal", self.bodies())
+        self.assertEqual(self.poll(hashRate=9500)["alerts"], [])
+        self.assertEqual(self.bodies().count("Miner 1: back to normal"), 1)
+
+    def test_offline_then_healthy_posts_back_to_normal_once(self):
+        self.poll(); self.cur = None
+        self.span(180)
+        self.cur = dict(BASE)
+        self.poll(); self.poll()
+        self.assertEqual(self.bodies(), ["Miner 1: not answering", "Miner 1: back to normal"])
+
+    def test_log_is_trimmed_to_the_newest_half(self):
+        self.p.log_max = 600
+        for i in range(30):
+            self.p.log(self.clock.t + i, "Miner 1", "HOT", "raised", f"entry {i:02d}")
+        self.assertLessEqual(os.path.getsize(self.p.log_path), 600)
+        ls = self.lines()
+        self.assertTrue(ls[-1].endswith("entry 29"))
+        self.assertGreater(len(ls), 3)
+        for l in ls: self.assertEqual(len(l.split(" | ")), 5)
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["alerts.log", "m.json"])
+
+    def test_log_under_the_limit_is_untouched(self):
+        for i in range(5): self.p.log(self.clock.t + i, "Miner 1", "HOT", "raised", f"entry {i}")
+        self.assertEqual(len(self.lines()), 5)
+
+    def test_server_started_line(self):
+        self.p.started(self.clock.t)
+        self.assertEqual(self.lines()[0].split(" | ")[1:], ["Widget", "SERVER", "started", "server started"])
 
     def test_offline_alert_waits_two_minutes(self):
         self.poll()
@@ -485,6 +567,45 @@ class SummaryTests(unittest.TestCase):
     def test_open_alert_from_before_the_window_still_shows(self):
         self.assertEqual(self.summary(["2026-11-11 22:00:00 | Miner 1 | NO_SHARES | raised | x"]),
                          "Miner alerts in the last 24 hours: Miner 1 no shares accepted since Nov 11 10:00pm.")
+
+
+
+class SummaryR2Tests(unittest.TestCase):
+    NOW = SummaryTests.NOW
+    summary = SummaryTests.summary
+
+    def test_open_before_a_restart_is_closed_at_the_restart(self):
+        self.assertEqual(self.summary(["2026-11-13 01:00:00 | Miner 1 | NOT_MINING | raised | x",
+                                       "2026-11-13 05:00:00 | Widget | SERVER | started | server started"]),
+                         "Miner alerts in the last 24 hours: Miner 1 not mining 1:00am to 5:00am.")
+
+    def test_old_open_alert_closed_by_restart_outside_window_is_not_printed(self):
+        self.assertEqual(self.summary(["2026-11-10 01:00:00 | Miner 1 | NOT_MINING | raised | x",
+                                       "2026-11-10 05:00:00 | Widget | SERVER | started | server started"]),
+                         "Miner alerts in the last 24 hours: none.")
+
+    def test_alert_raised_after_the_latest_restart_stays_open(self):
+        self.assertEqual(self.summary(["2026-11-12 08:00:00 | Miner 1 | HOT | raised | x",
+                                       "2026-11-13 05:00:00 | Widget | SERVER | started | server started",
+                                       "2026-11-13 06:00:00 | Miner 1 | BACKUP_POOL | raised | x"]),
+                         "Miner alerts in the last 24 hours: Miner 1 running hot yesterday 8:00am to 5:00am; Miner 1 on backup pool since 6:00am.")
+
+    def test_earlier_opened_and_closed_is_not_printed_but_still_open_prints_since(self):
+        self.assertEqual(self.summary(["2026-11-11 22:00:00 | Miner 1 | NO_SHARES | raised | x",
+                                       "2026-11-11 23:00:00 | Miner 1 | NO_SHARES | cleared | x",
+                                       "2026-11-11 23:30:00 | Miner 2 | HOT | raised | x"]),
+                         "Miner alerts in the last 24 hours: Miner 2 running hot since Nov 11 11:30pm.")
+
+    def test_long_output_is_capped_with_and_n_more(self):
+        lines = []
+        for i in range(30):
+            lines += [f"2026-11-13 {i % 6:02d}:{i:02d}:00 | Miner {i} | NOT_MINING | raised | x",
+                      f"2026-11-13 {i % 6:02d}:{i + 1:02d}:30 | Miner {i} | NOT_MINING | cleared | x"]
+        out = self.summary(lines)
+        self.assertLessEqual(len(out), 300)
+        self.assertRegex(out, r"; and \d+ more\.$")
+        self.assertGreater(len(out), 200)
+        self.assertEqual(self.summary(lines[:6]).count("more"), 0)
 
 
 if __name__ == "__main__":

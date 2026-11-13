@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, subprocess, sys, threading, time, traceback, urllib.request
+import json, os, subprocess, sys, tempfile, threading, time, traceback, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,9 +11,12 @@ CACHE_S = 10
 HIST_GAP = 30
 HIST_MAX = 120
 LOW_POLLS = 2
+REBOOT_GRACE_S = 120
+LOG_MAX = 1000000
 GAP_RESET = 120
 BACKGROUND_S = 15
-DEFAULTS = {"notify": True, "no_shares_minutes": 10, "offline_minutes": 2, "not_mining_ths": 0.1, "reminder_minutes": 60}
+DEFAULTS = {"notify": True, "no_shares_minutes": 10, "offline_minutes": 2, "not_mining_ths": 0.1, "reminder_minutes": 60,
+            "hot_clear_margin_c": 2}
 ORDER = ("OFFLINE", "NOT_MINING", "NO_SHARES", "HOT", "BACKUP_POOL")
 
 
@@ -57,7 +60,7 @@ def parse_settings(cfg):
     if isinstance(cfg.get("notify"), bool):
         s["notify"] = cfg["notify"]
     a = cfg.get("alerts") if isinstance(cfg.get("alerts"), dict) else {}
-    for k in ("no_shares_minutes", "offline_minutes", "not_mining_ths", "reminder_minutes"):
+    for k in ("no_shares_minutes", "offline_minutes", "not_mining_ths", "reminder_minutes", "hot_clear_margin_c"):
         v = num(a.get(k))
         if v is not None and v > 0:
             s[k] = v
@@ -121,6 +124,7 @@ class Poller:
         self.alerts = {}  # host -> alert tracking state
         self.alock = threading.Lock()
         self.log_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), "alerts.log")
+        self.log_max = LOG_MAX
 
     def load(self):
         try:
@@ -161,8 +165,9 @@ class Poller:
         h.append([round(now, 1), ths])
         del h[:-HIST_MAX]
 
-    def settle(self, m, t, codes):
-        name, active = m["name"], self.alerts[m["host"]]["active"]
+    def settle(self, m, t, codes, reading_ok=True):
+        st = self.alerts[m["host"]]
+        name, active = m["name"], st["active"]
         for code, (level, text, note) in codes.items():
             if code not in active:
                 active[code] = {"noted": t}
@@ -176,7 +181,10 @@ class Poller:
         gone = [c for c in active if c not in codes]
         for c in gone:
             self.log(t, name, c, "cleared", active.pop(c)["text"])
-        if gone and not active:
+        if gone:
+            st["await_normal"] = True
+        if st.get("await_normal") and not active and reading_ok:
+            st["await_normal"] = False
             self.say(f"{name}: back to normal")
         return self.shown(active)
 
@@ -197,7 +205,9 @@ class Poller:
                 hr, acc = num(info.get("hashRate")), num(info.get("sharesAccepted"))
                 gap = st["last"] is not None and t - st["last"] > GAP_RESET
                 st["last"] = t
-                st["low"] = st["low"] + 1 if hr is not None and hr / 1000 < cfg["not_mining_ths"] and not gap else 0
+                zero = hr is not None and hr / 1000 < cfg["not_mining_ths"]
+                up = num(info.get("uptimeSeconds"))
+                st["low"] = st["low"] + 1 if zero and not gap and not (up is not None and up < REBOOT_GRACE_S) else 0
                 if acc is None or st["shares"] is None or gap or acc != st["shares"]:
                     st["shares"], st["since"] = acc, t
                 if st["low"] >= LOW_POLLS:
@@ -208,9 +218,9 @@ class Poller:
                 if where(info) == "Backup pool":
                     codes["BACKUP_POOL"] = ("amber", "BACKUP POOL", "on its backup pool")
                 temp = num(info.get("temp"))
-                if temp is not None and temp >= HOT_C:
+                if temp is not None and temp >= (HOT_C - cfg["hot_clear_margin_c"] if "HOT" in st["active"] else HOT_C):
                     codes["HOT"] = ("red", f"HOT · {round(temp)} °C", f"running hot, {round(temp)} °C")
-            return self.settle(m, t, codes)
+            return self.settle(m, t, codes, reading_ok=info is None or not zero)
 
     def log(self, t, name, code, kind, text):
         line = f"{datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S} | {clean(name)} | {code} | {kind} | {clean(text)}\n"
@@ -219,6 +229,26 @@ class Poller:
                 f.write(line)
         except OSError as e:
             print(f"alert log failed: {e}", file=sys.stderr, flush=True)
+            return
+        self.trim_log()
+
+    def trim_log(self):
+        try:
+            if os.path.getsize(self.log_path) <= self.log_max:
+                return
+            with open(self.log_path, "rb") as f:
+                data = f.read()
+            data = data[len(data) // 2:]
+            data = data[data.find(b"\n") + 1:]
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.log_path), prefix=".alerts.", suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, self.log_path)
+        except OSError as e:
+            print(f"alert log trim failed: {e}", file=sys.stderr, flush=True)
+
+    def started(self, t=None):
+        self.log(t or now(), "Widget", "SERVER", "started", "server started")
 
     def say(self, body):
         if not self.settings["notify"]:
@@ -331,6 +361,7 @@ if __name__ == "__main__":
     cfg = os.environ.get("MINER_CONFIG") or (sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "miners.json"))
     port = int(os.environ.get("MINER_PORT") or (sys.argv[2] if len(sys.argv) > 2 else 8757))
     srv = make_server(cfg, port)
+    srv.poller.started()
 
     def keep_polling():
         while True:

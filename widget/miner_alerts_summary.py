@@ -2,6 +2,7 @@
 import os, sys
 from datetime import datetime, timedelta
 
+LIMIT = 300
 PHRASE = {"NOT_MINING": "not mining", "NO_SHARES": "no shares accepted", "BACKUP_POOL": "on backup pool",
           "OFFLINE": "offline", "HOT": "running hot"}
 
@@ -30,6 +31,10 @@ def summary(path, now=None):
             name, code, kind = p[1], p[2], p[3]
         except (ValueError, IndexError):
             continue
+        if code == "SERVER" and kind == "started":
+            spans += [(a, at, n, c) for (n, c), a in open_.items()]
+            open_.clear()
+            continue
         key = (name, code)
         if kind == "raised" and key not in open_:
             open_[key] = at
@@ -41,7 +46,15 @@ def summary(path, now=None):
         if (b or now) < since or a > now or code not in PHRASE:
             continue
         parts.append(f"{name} {PHRASE[code]} " + (f"since {when(a, now)}" if b is None else f"{when(a, now)} to {when(b, now)}"))
-    return "Miner alerts in the last 24 hours: " + ("; ".join(parts) if parts else "none") + "."
+    head = "Miner alerts in the last 24 hours: "
+    if not parts:
+        return head + "none."
+    for keep in range(len(parts), -1, -1):
+        tail = f"{'; ' if keep else ''}and {len(parts) - keep} more" if keep < len(parts) else ""
+        line = head + "; ".join(parts[:keep]) + tail + "."
+        if len(line) <= LIMIT:
+            break
+    return line
 
 
 if __name__ == "__main__":

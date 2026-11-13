@@ -91,7 +91,8 @@ Alert settings live in the object form of the same file, next to `miners`. Both 
     "no_shares_minutes": 10,
     "offline_minutes": 2,
     "not_mining_ths": 0.1,
-    "reminder_minutes": 60
+    "reminder_minutes": 60,
+    "hot_clear_margin_c": 2
   }
 }
 ```
@@ -111,17 +112,19 @@ The server checks every miner on each poll and raises an alert when:
 | NO SHARES | red | the miner answers but its accepted-share count has not gone up for 10 minutes (`no_shares_minutes`) |
 | BACKUP POOL | amber | the miner reports it is on its fallback pool |
 | OFFLINE | red | the miner has not answered for 2 minutes (`offline_minutes`) |
-| HOT | red | the miner reports 70 °C or more |
+| HOT | red | the miner reports 70 °C or more; it clears only once the temperature is below 68 °C (`hot_clear_margin_c`, default 2), so a miner sitting at the edge does not notify over and over |
 
 Notes on how they behave:
 
 - NO SHARES needs a baseline: the server must have watched the miner without a break for the full 10 minutes before it can raise this. A share count that drops (the miner rebooted) counts as movement, not a stall. A gap of more than 2 minutes between answers starts the watch again.
+- A miner that has been running for under 2 minutes (the `uptimeSeconds` it reports) never raises NOT MINING, so a restart that reads zero hashrate at first stays quiet. If the miner does not report that field, nothing changes.
+- When a miner answers again after being offline, "back to normal" is posted only when it has no active alert and is reporting a hashrate; a miner that answers but still reads zero stays quiet until it recovers.
 - OFFLINE shows in the panel straight away as "not answering"; the alert and notification wait the 2 minutes so a short blip stays quiet.
 - On the widget, the selected miner shows a banner under the status bar (red, or amber for the backup pool). Each miner's button shows a small red or amber dot while it has an alert, so a problem on another miner is visible, and the combined view lists each miner's alert.
 - Notifications: one macOS notification when a miner goes into an alert (title "Miner alert"), one when all of that miner's alerts clear, and one reminder every 60 minutes (`reminder_minutes`) while an alert stays on. They are posted with `/usr/bin/osascript`. If that fails, the failure is written to `widget/server.log` and the widget carries on. Alerts are tracked only while the server runs, so a restart can post a fresh notification for a condition that was already active.
 - Turn notifications off with `"notify": false` in `widget/miners.json`. Banners, dots and the log stay on.
-- Every raise, reminder and clear is appended to `widget/alerts.log` (next to `miners.json`, never committed), one line each: local time, miner name, alert code, what happened, text.
-- `python3 widget/miner_alerts_summary.py` prints one line about the last 24 hours, for example `Miner alerts in the last 24 hours: Miner 1 not mining 2:14am to 2:31am; Miner 1 on backup pool since 3:05am.` or `... none.`
+- Every raise, reminder and clear is appended to `widget/alerts.log` (next to `miners.json`, never committed), one line each: local time, miner name, alert code, what happened, text. The server also appends one "server started" line each time it starts. When the log passes about 1 MB the server keeps the newest half, rewriting it through a temporary file in the same folder.
+- `python3 widget/miner_alerts_summary.py` prints one line about the last 24 hours. An alert that opened and closed earlier is left out. An alert that was still open when the server last started is shown as ending at that start, because it was not watched after that; one still open since then shows as "since <time>". The line is cut at about 300 characters and ends with "and N more" when there is more. For example `Miner alerts in the last 24 hours: Miner 1 not mining 2:14am to 2:31am; Miner 1 on backup pool since 3:05am.` or `... none.`
 
 ## macOS Local Network permission
 
