@@ -1,0 +1,6 @@
+widget/miners.json
+widget/miner_widget_window
+widget/*.log
+__pycache__/
+*.pyc
+.DS_Store
