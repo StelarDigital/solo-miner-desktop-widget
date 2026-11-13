@@ -36,6 +36,12 @@ body::after{content:'';position:absolute;inset:0;pointer-events:none;
 .tab.na{opacity:.4}.tab.na.sel{opacity:.7}
 .all .ml{display:flex;justify-content:space-between;align-items:center;height:20px;font-size:9px}
 .ml .n{color:#7fb4d6;width:52px}.ml .v{color:#ffb000;width:46px;text-align:right}.ml .w{color:#7fe8ff;width:38px;text-align:right}.ml .d{width:8px;height:8px;border-radius:50%;margin-left:4px}
+.alert{height:16px;flex:none;border:1px solid;border-radius:6px;padding:0 6px;font-size:8px;font-weight:bold;letter-spacing:.04em;line-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.alert.red{color:#ff4d7d;background:#2a0a14;border-color:#ff4d7d;box-shadow:0 0 6px rgba(255,77,125,.4)}
+.alert.amb{color:#ffb000;background:#1a1405;border-color:#ffb000;box-shadow:0 0 6px rgba(255,176,0,.35)}
+.chart.c{height:37px}.chart.c .msg{top:19px}
+.dot{position:absolute;top:3px;right:4px;width:6px;height:6px;border-radius:50%;background:#ff4d7d;box-shadow:0 0 5px #ff4d7d}.dot.amb{background:#ffb000;box-shadow:0 0 5px #ffb000}
+.ma{height:11px;line-height:11px;font-size:8px;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ma.red{color:#ff4d7d}.ma.amb{color:#ffb000}
 .np{height:304px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#5f87ad;font-size:10px;letter-spacing:.12em;font-weight:bold;background:#0d1424;border:1px solid #1b2740;border-radius:8px}
 .np span{color:#7fb4d6;font-size:8px;font-weight:normal;letter-spacing:.04em}
 </style></head><body>
@@ -100,9 +106,13 @@ function chartSvg(hist,dim,W,H,top,lblOut){
   }
   lblOut.v=lab;return s+'</svg>';
 }
-function chart(hist,dim){
-  var o={},svg=chartSvg(hist,dim,221,56,18,o);
-  return '<div class="tile chart"><span class="lb" style="position:relative;z-index:1">HASHRATE · '+o.v+'</span>'+svg+'</div>';
+function alertOf(al){
+  if(!al||!al.length)return null;
+  return {cls:al[0].level==='amber'?'amb':'red',text:al[0].text+(al.length>1?' +'+(al.length-1):'')};
+}
+function chart(hist,dim,cmp){
+  var o={},svg=cmp?chartSvg(hist,dim,221,35,15,o):chartSvg(hist,dim,221,56,18,o);
+  return '<div class="tile chart'+(cmp?' c':'')+'"><span class="lb" style="position:relative;z-index:1">HASHRATE · '+o.v+'</span>'+svg+'</div>';
 }
 function tile(label,inner,cls){return '<div class="tile '+(cls||'')+'"><span class="lb">'+label+'</span>'+inner+'</div>'}
 function live(m){return m.state==='ok'||m.state==='hot'}
@@ -110,13 +120,13 @@ function eff(w,t){return (w!=null&&t)?(w/t).toFixed(1):null}
 function panel(m){
   if(m.state==='not_set')return '<div class="np"><div style="opacity:.5">'+segDigits('--.-',34,false)+'</div>NOT PLUGGED IN YET<span>'+esc(m.name)+' has no address yet</span></div>';
   var ok=live(m),ths=ok?f1(m.ths):null,w=ok?m.watts:null,t=ok?m.temp:null,ef=eff(w,m.ths);
-  var h=tile('HASHRATE','<div class="num">'+segDigits(ths==null?'--.-':ths,40,ths!=null)+'<span class="u">TH/s</span></div>','hero');
+  var al=m.alerts||[],a=alertOf(al),h=(a?'<div class="alert '+a.cls+'">'+esc(a.text)+'</div>':'')+tile('HASHRATE','<div class="num">'+segDigits(ths==null?'--.-':ths,40,ths!=null)+'<span class="u">TH/s</span></div>','hero');
   h+='<div class="two">'+tile('POWER','<div class="num">'+segDigits(w==null?'---':String(w),22,w!=null)+'<span class="u">W</span></div>')
     +tile('EFFICIENCY','<div class="num">'+segDigits(ef==null?'--.-':ef,22,ef!=null)+'<span class="u">J/TH</span></div>')+'</div>';
   h+='<div class="tile temp"><span class="lb" style="position:absolute;left:7px;top:4px">TEMPERATURE</span><div style="margin-top:14px">'+gauge(t)+'</div>'
     +'<div class="info" style="margin-top:6px"><div class="kv"><span class="lb">FAN</span><b>'+(ok&&m.fan!=null?m.fan+' rpm':'--')+'</b></div>'
     +'<div class="kv"><span class="lb">POOL</span><b>'+(ok?esc(m.mining==='Your node'?'your node':m.mining==='Backup pool'?'backup pool':m.mining):'--')+'</b></div></div></div>';
-  var c=chart(ok?m.history:[],!ok);
+  var c=chart(ok?m.history:[],!ok,!!a);
   if(!ok)c=c.replace(/<\/div>$/,'<div class="msg">'+esc(m.message||'Not answering')+'</div></div>');
   h+=c;
   h+='<div class="stats">'+tile('SHARES','<b>'+(ok?fmtN(m.accepted):'--')+'</b>'+(ok&&m.rejected?'<i>'+fmtN(m.rejected)+' REJ</i>':''))
@@ -129,13 +139,15 @@ function allPanel(miners){
   var h=tile('COMBINED HASHRATE','<div class="num">'+segDigits(has?th.toFixed(1):'--.-',40,has)+'<span class="u">TH/s</span></div>','hero');
   h+='<div class="two">'+tile('POWER','<div class="num">'+segDigits(has?String(Math.round(w)):'---',22,has)+'<span class="u">W</span></div>')
     +tile('EFFICIENCY','<div class="num">'+segDigits(ef==null?'--.-':ef,22,ef!=null)+'<span class="u">J/TH</span></div>')+'</div>';
-  var rows='',n=miners.length,ch=Math.max(20,Math.min(56,Math.floor((178-14-n*24)/n)));
+  var rows='',n=miners.length,na=miners.filter(function(m){return alertOf(m.alerts)}).length,ch=Math.max(20,Math.min(56,Math.floor((178-14-n*24-na*11)/n)));
   miners.forEach(function(m){
-    var col=live(m)?(m.state==='hot'?'#ff4d7d':'#39ffb0'):m.state==='not_set'?'#4a5a78':'#ff4d7d',o={};
+    var col=live(m)?(m.state==='hot'?'#ff4d7d':'#39ffb0'):m.state==='not_set'?'#4a5a78':'#ff4d7d',o={},a=alertOf(m.alerts);
+    if(a)col=a.cls==='amb'?AMB:'#ff4d7d';
     rows+='<div class="ml"><span class="n">'+esc(m.name).toUpperCase()+'</span>'
      +(live(m)?'<span class="v">'+f1(m.ths)+' T</span><span class="w">'+m.watts+' W</span><span class="w" style="width:30px;color:'+(m.state==='hot'?'#ff4d7d':'#7fb4d6')+'">'+m.temp+'\u00b0</span>'
        :'<span style="color:'+(m.state==='not_set'?'#4a5a78':'#ff4d7d')+';font-size:8px">'+(m.state==='not_set'?'NOT PLUGGED IN':'NOT ANSWERING')+'</span>')
      +'<i class="d" style="background:'+col+';box-shadow:0 0 6px '+col+'"></i></div>';
+    if(a)rows+='<div class="ma '+a.cls+'">'+esc(a.text)+'</div>';
     if(m.state!=='not_set')rows+='<div style="height:'+ch+'px;position:relative;margin:0 -7px">'+chartSvg(m.history,!live(m),221,ch,4,o)+'</div>';
   });
   h+='<div class="tile all" style="height:178px"><span class="lb">MINERS</span><div style="margin-top:4px">'+rows+'</div></div>';
@@ -161,7 +173,7 @@ function render(){
   var ms=DATA.miners;
   if(SEL!=='all'&&!(ms[+SEL-1]))SEL='all';
   var th='';
-  ms.forEach(function(m,i){th+='<button class="tab'+(String(i+1)===SEL?' sel':'')+(m.state==='not_set'?' na':'')+'" data-tab="'+(i+1)+'">'+esc(m.name).toUpperCase()+'</button>'});
+  ms.forEach(function(m,i){var a=alertOf(m.alerts);th+='<button class="tab'+(String(i+1)===SEL?' sel':'')+(m.state==='not_set'?' na':'')+'" data-tab="'+(i+1)+'">'+esc(m.name).toUpperCase()+(a?'<i class="dot '+(a.cls==='amb'?'amb':'')+'"></i>':'')+'</button>'});
   th+='<button class="tab'+(SEL==='all'?' sel':'')+'" data-tab="all">ALL</button>';
   tabs.innerHTML=th;
   if(SEL==='all'){

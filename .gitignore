@@ -4,3 +4,4 @@ widget/*.log
 __pycache__/
 *.pyc
 .DS_Store
+alerts.log

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, sys, threading, time, urllib.request
+import json, os, subprocess, sys, threading, time, traceback, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +10,15 @@ TIMEOUT = 4
 CACHE_S = 10
 HIST_GAP = 30
 HIST_MAX = 120
+LOW_POLLS = 2
+GAP_RESET = 120
+BACKGROUND_S = 15
+DEFAULTS = {"notify": True, "no_shares_minutes": 10, "offline_minutes": 2, "not_mining_ths": 0.1, "reminder_minutes": 60}
+ORDER = ("OFFLINE", "NOT_MINING", "NO_SHARES", "HOT", "BACKUP_POOL")
+
+
+def now():
+    return time.time()
 
 
 def clock(ts):
@@ -39,6 +48,30 @@ def duration(sec):
 
 def num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def parse_settings(cfg):
+    s = dict(DEFAULTS)
+    if not isinstance(cfg, dict):
+        return s
+    if isinstance(cfg.get("notify"), bool):
+        s["notify"] = cfg["notify"]
+    a = cfg.get("alerts") if isinstance(cfg.get("alerts"), dict) else {}
+    for k in ("no_shares_minutes", "offline_minutes", "not_mining_ths", "reminder_minutes"):
+        v = num(a.get(k))
+        if v is not None and v > 0:
+            s[k] = v
+    return s
+
+
+def clean(text):
+    return " ".join("".join(c if c.isprintable() else " " for c in str(text)).replace("|", "/").split())
+
+
+def applescript(body, title="Miner alert"):
+    def q(t):
+        return '"' + clean(t)[:200].replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return f"display notification {q(body)} with title {q(title)}"
 
 
 def where(info, my_nodes=()):
@@ -84,11 +117,16 @@ class Poller:
         self.cached_at = 0.0
         self.seen = {}  # host -> {"last_ok": ts, "first_fail": ts}
         self.hist = {}  # host -> [[ts, ths], ...] ring buffer
+        self.settings = dict(DEFAULTS)
+        self.alerts = {}  # host -> alert tracking state
+        self.alock = threading.Lock()
+        self.log_path = os.path.join(os.path.dirname(os.path.abspath(config_path)), "alerts.log")
 
     def load(self):
         try:
             with open(self.config_path) as f:
                 cfg = json.load(f)
+            settings = parse_settings(cfg)
             nodes = []
             if isinstance(cfg, dict):
                 nodes = [str(h).strip() for h in cfg.get("my_node_hosts") or []]
@@ -101,6 +139,7 @@ class Poller:
                     raise ValueError
                 out.append({"name": str(e.get("name") or f"Miner {i + 1}"),
                             "host": str(e.get("host") or "").strip()})
+            self.settings = settings
             return out, nodes
         except Exception:
             return None
@@ -122,31 +161,111 @@ class Poller:
         h.append([round(now, 1), ths])
         del h[:-HIST_MAX]
 
+    def settle(self, m, t, codes):
+        name, active = m["name"], self.alerts[m["host"]]["active"]
+        for code, (level, text, note) in codes.items():
+            if code not in active:
+                active[code] = {"noted": t}
+                self.log(t, name, code, "raised", text)
+                self.say(f"{name}: {note}")
+            elif t - active[code]["noted"] >= self.settings["reminder_minutes"] * 60:
+                active[code]["noted"] = t
+                self.log(t, name, code, "reminder", text)
+                self.say(f"{name}: still {note}")
+            active[code].update(level=level, text=text)
+        gone = [c for c in active if c not in codes]
+        for c in gone:
+            self.log(t, name, c, "cleared", active.pop(c)["text"])
+        if gone and not active:
+            self.say(f"{name}: back to normal")
+        return self.shown(active)
+
+    @staticmethod
+    def shown(active):
+        return [{"code": c, "level": active[c]["level"], "text": active[c]["text"]} for c in ORDER if c in active]
+
+    def track(self, m, t, info):
+        with self.alock:
+            st = self.alerts.setdefault(m["host"], {"low": 0, "shares": None, "since": None, "last": None, "active": {}})
+            cfg, codes = self.settings, {}
+            if info is None:
+                down = t - self.seen[m["host"]]["first_fail"]
+                if down < cfg["offline_minutes"] * 60:
+                    return self.shown(st["active"])
+                codes["OFFLINE"] = ("red", f"OFFLINE · no answer for {int(down // 60)} min", "not answering")
+            else:
+                hr, acc = num(info.get("hashRate")), num(info.get("sharesAccepted"))
+                gap = st["last"] is not None and t - st["last"] > GAP_RESET
+                st["last"] = t
+                st["low"] = st["low"] + 1 if hr is not None and hr / 1000 < cfg["not_mining_ths"] and not gap else 0
+                if acc is None or st["shares"] is None or gap or acc != st["shares"]:
+                    st["shares"], st["since"] = acc, t
+                if st["low"] >= LOW_POLLS:
+                    codes["NOT_MINING"] = ("red", "NOT MINING · hashrate is zero", "not mining, hashrate is zero")
+                if acc is not None and t - st["since"] >= cfg["no_shares_minutes"] * 60:
+                    codes["NO_SHARES"] = ("red", f"NO SHARES · none accepted for {int((t - st['since']) // 60)} min",
+                                          f"no shares accepted for {cfg['no_shares_minutes']:g} minutes")
+                if where(info) == "Backup pool":
+                    codes["BACKUP_POOL"] = ("amber", "BACKUP POOL", "on its backup pool")
+                temp = num(info.get("temp"))
+                if temp is not None and temp >= HOT_C:
+                    codes["HOT"] = ("red", f"HOT · {round(temp)} °C", f"running hot, {round(temp)} °C")
+            return self.settle(m, t, codes)
+
+    def log(self, t, name, code, kind, text):
+        line = f"{datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S} | {clean(name)} | {code} | {kind} | {clean(text)}\n"
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError as e:
+            print(f"alert log failed: {e}", file=sys.stderr, flush=True)
+
+    def say(self, body):
+        if not self.settings["notify"]:
+            return
+        try:
+            r = subprocess.run(["/usr/bin/osascript", "-e", applescript(body)], capture_output=True, timeout=5)
+            if r.returncode:
+                print(f"notification failed: osascript exit {r.returncode}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"notification failed: {e}", file=sys.stderr, flush=True)
+
+    def alerts_for(self, m, t, info):
+        try:
+            return self.track(m, t, info)
+        except Exception:
+            traceback.print_exc()
+            return []
+
     def one(self, m, my_nodes=()):
-        now = time.time()
+        t = now()
         if not m["host"]:
             return {"name": m["name"], "state": "not_set", "message": f"{m['name']}: not plugged in yet",
-                    "ip": "", "history": []}
+                    "ip": "", "history": [], "alerts": []}
         seen = self.seen.setdefault(m["host"], {})
         try:
             info = self.fetch(m["host"])
-            row = read_row(m, info, now, my_nodes)
-            seen["last_ok"], seen["first_fail"] = now, None
-            self.record(m["host"], now, row["ths"])
-            row["history"] = [list(p) for p in self.hist.get(m["host"], [])]
-            return row
+            row = read_row(m, info, t, my_nodes)
         except Exception:
-            if not seen.get("first_fail"):
-                seen["first_fail"] = now
-            since = seen.get("last_ok") or seen["first_fail"]
-            return {"name": m["name"], "state": "not_answering",
-                    "message": f"Not answering since {clock(since)}", "ip": m["host"],
-                    "history": [list(p) for p in self.hist.get(m["host"], [])]}
+            info = None
+        if info is not None:
+            seen["last_ok"], seen["first_fail"] = t, None
+            self.record(m["host"], t, row["ths"])
+            row["history"] = [list(p) for p in self.hist.get(m["host"], [])]
+            row["alerts"] = self.alerts_for(m, t, info)
+            return row
+        if not seen.get("first_fail"):
+            seen["first_fail"] = t
+        since = seen.get("last_ok") or seen["first_fail"]
+        return {"name": m["name"], "state": "not_answering",
+                "message": f"Not answering since {clock(since)}", "ip": m["host"],
+                "history": [list(p) for p in self.hist.get(m["host"], [])],
+                "alerts": self.alerts_for(m, t, None)}
 
     def data(self):
         with self.lock:
-            now = time.time()
-            if self.cached is not None and now - self.cached_at < CACHE_S:
+            t = now()
+            if self.cached is not None and t - self.cached_at < CACHE_S:
                 return self.cached
             loaded = self.load()
             if loaded is None:
@@ -161,7 +280,7 @@ class Poller:
                     totals = {"ths": round(sum(r["ths"] or 0 for r in live), 1),
                               "watts": round(sum(r["watts"] or 0 for r in live))}
                 result = {"error": None, "miners": rows, "totals": totals}
-            self.cached, self.cached_at = result, time.time()
+            self.cached, self.cached_at = result, now()
             return result
 
 
@@ -211,4 +330,15 @@ def make_server(config_path, port, host="127.0.0.1"):
 if __name__ == "__main__":
     cfg = os.environ.get("MINER_CONFIG") or (sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "miners.json"))
     port = int(os.environ.get("MINER_PORT") or (sys.argv[2] if len(sys.argv) > 2 else 8757))
-    make_server(cfg, port).serve_forever()
+    srv = make_server(cfg, port)
+
+    def keep_polling():
+        while True:
+            try:
+                srv.poller.data()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(BACKGROUND_S)
+
+    threading.Thread(target=keep_polling, daemon=True).start()
+    srv.serve_forever()
